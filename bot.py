@@ -12,6 +12,7 @@ from bs4 import BeautifulSoup
 import tempfile
 import time
 from functools import wraps
+from datetime import datetime, timedelta
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -26,14 +27,24 @@ def rate_limit(limit_seconds=2):
         
         @wraps(func)
         async def wrapper(self, update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-            user_id = update.effective_user.id
+            # Получаем user_id в зависимости от типа update
+            if hasattr(update, 'effective_user'):
+                user_id = update.effective_user.id
+            elif hasattr(update, 'from_user'):  # Для CallbackQuery
+                user_id = update.from_user.id
+            elif hasattr(update, 'message') and update.message:
+                user_id = update.message.from_user.id
+            else:
+                # Если не можем определить пользователя, пропускаем проверку
+                return await func(self, update, context, *args, **kwargs)
+                
             current_time = time.time()
             
             if user_id in last_called:
                 time_passed = current_time - last_called[user_id]
                 if time_passed < limit_seconds:
                     try:
-                        if update.callback_query:
+                        if hasattr(update, 'callback_query'):
                             await update.callback_query.answer(
                                 f"⏳ Подождите {limit_seconds - int(time_passed)} секунд", 
                                 show_alert=False
@@ -71,6 +82,9 @@ class ScheduleBot:
             timetable_url = "https://ktmu-sutd.ru/timetable.html"
             
             session = requests.Session()
+            # КРИТИЧЕСКИ ВАЖНО: отключаем использование системного прокси
+            session.trust_env = False
+            
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
@@ -186,6 +200,9 @@ class ScheduleBot:
             ]
             
             session = requests.Session()
+            # Отключаем прокси и для альтернативной загрузки
+            session.trust_env = False
+            
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
             
             for link in known_links:
@@ -215,6 +232,29 @@ class ScheduleBot:
                 success = self.download_schedule_from_website()
                 if not success:
                     logger.warning("⚠️ Не удалось загрузить данные")
+                    # Пробуем загрузить локальный файл, если есть
+                    if self.excel_file and os.path.exists(self.excel_file):
+                        logger.info("🔄 Используем локальный файл...")
+                        try:
+                            excel_file = pd.ExcelFile(self.excel_file)
+                            sheet_names = excel_file.sheet_names
+                            
+                            target_sheet = None
+                            for sheet in sheet_names:
+                                if any(keyword in sheet.lower() for keyword in ['1 поток', '1_поток', 'kr', 'крд']):
+                                    target_sheet = sheet
+                                    break
+                            
+                            if not target_sheet and sheet_names:
+                                target_sheet = sheet_names[0]
+                            
+                            if target_sheet:
+                                self.df_cache = pd.read_excel(self.excel_file, sheet_name=target_sheet, header=None)
+                                self.data_loaded = True
+                                logger.info(f"✅ DataFrame загружен с локального файла: {target_sheet}")
+                                return self.df_cache
+                        except Exception as e:
+                            logger.error(f"❌ Ошибка загрузки локального файла: {e}")
                     return None
             
             if self.df_cache is None and self.excel_file and os.path.exists(self.excel_file):
@@ -244,6 +284,114 @@ class ScheduleBot:
         """Проверка, загружены ли данные"""
         return self.data_loaded and self.df_cache is not None
 
+    def get_current_academic_week(self):
+        """Получить текущую учебную неделю из расписания"""
+        try:
+            week_info = self.get_week_info()
+            if not week_info:
+                return "1"  # По умолчанию первая неделя
+            
+            # Получаем текущую дату
+            today = pd.Timestamp.now().normalize()
+            
+            # Ищем неделю, которая содержит текущую дату
+            for week_num, info in week_info.items():
+                week_desc = info.get('description', '').lower()
+                
+                # Парсим даты из описания недели
+                dates = re.findall(r'\d{1,2}\.\d{1,2}\.\d{4}', week_desc)
+                if len(dates) >= 2:
+                    try:
+                        start_date = pd.to_datetime(dates[0], format='%d.%m.%Y')
+                        end_date = pd.to_datetime(dates[1], format='%d.%m.%Y')
+                        
+                        if start_date <= today <= end_date:
+                            return week_num
+                    except:
+                        continue
+            
+            # Если не нашли, возвращаем первую неделю
+            return sorted(week_info.keys())[0]
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка определения учебной недели: {e}")
+            return "1"
+
+    def get_monday_date(self, week_number):
+        """Получить дату понедельника для указанной недели"""
+        try:
+            df = self.get_dataframe()
+            if df is None:
+                return None
+            
+            week_info = self.get_week_info()
+            if not week_info or week_number not in week_info:
+                return None
+            
+            week_data = week_info[week_number]
+            monday_col = week_data['columns'][0]  # Первый столбец - понедельник
+            
+            # Ищем дату в строке 4 (индекс 3) для понедельника
+            date_cell = df.iloc[3, monday_col]
+            if pd.notna(date_cell):
+                date_str = str(date_cell).strip()
+                # Пытаемся извлечь дату
+                date_match = re.search(r'\d{1,2}\.\d{1,2}\.\d{4}', date_str)
+                if date_match:
+                    try:
+                        return datetime.strptime(date_match.group(0), '%d.%m.%Y')
+                    except:
+                        pass
+            
+            # Если не нашли дату в ячейке, пытаемся извлечь из описания недели
+            week_desc = week_data.get('description', '')
+            dates = re.findall(r'\d{1,2}\.\d{1,2}\.\d{4}', week_desc)
+            if dates:
+                try:
+                    return datetime.strptime(dates[0], '%d.%m.%Y')
+                except:
+                    pass
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения даты понедельника: {e}")
+            return None
+
+    def get_day_date(self, week_number, day_index):
+        """Получить дату для конкретного дня недели"""
+        try:
+            # Получаем дату понедельника
+            monday_date = self.get_monday_date(week_number)
+            if not monday_date:
+                return ""
+            
+            # Вычисляем дату для текущего дня (добавляем дни к понедельнику)
+            target_date = monday_date + timedelta(days=day_index)
+            return target_date.strftime('%d.%m.%Y')
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения даты дня: {e}")
+            return ""
+
+    def get_current_week_and_day(self):
+        """Получить текущую неделю и день с правильной логикой"""
+        week_number = self.get_current_academic_week()
+        
+        # Текущий день недели (0-понедельник, 6-воскресенье)
+        current_day = pd.Timestamp.now().dayofweek
+        if current_day >= 6:  # Воскресенье
+            current_day = 0   # Показываем понедельник
+            # Если воскресенье, переходим к следующей неделе
+            week_info = self.get_week_info()
+            if week_info:
+                weeks = sorted(week_info.keys(), key=int)
+                current_index = weeks.index(week_number)
+                if current_index < len(weeks) - 1:
+                    week_number = weeks[current_index + 1]
+        
+        return week_number, current_day
+
     def get_week_info(self):
         """Оптимизированное получение информации о неделях"""
         if self.week_info_cache is not None:
@@ -260,13 +408,14 @@ class ScheduleBot:
                 cell_value = df.iloc[3, col]
                 if pd.notna(cell_value) and 'неделя' in str(cell_value).lower():
                     week_text = str(cell_value)
-                    week_num, week_type = self._parse_week_info(week_text)
+                    week_num, week_type, date_range = self._parse_week_info(week_text)
                     
                     if week_num:
                         week_columns = self._find_week_columns_simple(col, week_num)
                         week_info[week_num] = {
                             'type': week_type,
                             'description': week_text,
+                            'date_range': date_range,
                             'columns': week_columns,
                             'header_column': col
                         }
@@ -279,21 +428,27 @@ class ScheduleBot:
             return {}
 
     def _parse_week_info(self, week_text):
-        """Быстрый парсинг информации о неделе"""
+        """Быстрый парсинг информации о неделе с датами"""
         week_text_lower = week_text.lower()
         
         week_type = 'Нечетная' if 'нечетная' in week_text_lower or 'числитель' in week_text_lower else \
                    'Четная' if 'четная' in week_text_lower or 'знаменатель' in week_text_lower else 'Неизвестно'
         
+        # Ищем номер недели
         bracket_match = re.search(r'\((\d+)\)', week_text)
         if bracket_match:
-            return bracket_match.group(1), week_type
+            week_num = bracket_match.group(1)
+        else:
+            numbers = re.findall(r'\d+', week_text)
+            week_num = numbers[0] if numbers else None
         
-        numbers = re.findall(r'\d+', week_text)
-        if numbers:
-            return numbers[0], week_type
+        # Ищем даты
+        dates = re.findall(r'\d{1,2}\.\d{1,2}\.\d{4}', week_text)
+        date_range = ""
+        if len(dates) >= 2:
+            date_range = f"{dates[0]} - {dates[1]}"
         
-        return None, week_type
+        return week_num, week_type, date_range
 
     def _find_week_columns_simple(self, header_col, week_number):
         """Быстрый поиск столбцов недели"""
@@ -344,32 +499,6 @@ class ScheduleBot:
         await application.bot.set_my_commands(commands)
         await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
-    async def show_quick_commands_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать меню быстрых команд рядом с кнопкой прикрепления файла"""
-        keyboard = [
-            [InlineKeyboardButton("📅 Сегодня", callback_data="quick_today")],
-            [InlineKeyboardButton("📆 Завтра", callback_data="quick_tomorrow")],
-            [InlineKeyboardButton("📋 Главное меню", callback_data="back_to_menu")],
-            [
-                InlineKeyboardButton("Пн", callback_data="quick_monday"),
-                InlineKeyboardButton("Вт", callback_data="quick_tuesday"),
-                InlineKeyboardButton("Ср", callback_data="quick_wednesday"),
-                InlineKeyboardButton("Чт", callback_data="quick_thursday"),
-                InlineKeyboardButton("Пт", callback_data="quick_friday"),
-                InlineKeyboardButton("Сб", callback_data="quick_saturday")
-            ],
-            [InlineKeyboardButton("🔄 Обновить", callback_data="refresh_schedule")],
-            [InlineKeyboardButton("📊 Недели", callback_data="select_week")],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        text = (
-            "🚀 <b>Быстрые команды</b>\n\n"
-            "Выберите действие для быстрого доступа к расписанию:"
-        )
-        
-        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='HTML')
-
     @rate_limit(limit_seconds=2)
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /start с автоматическим обновлением"""
@@ -390,8 +519,8 @@ class ScheduleBot:
                 parse_mode='HTML'
             )
             await asyncio.sleep(1)
-            # Показываем меню быстрых команд после запуска
-            await self.show_quick_commands_menu(update, context)
+            # Показываем главное меню после запуска
+            await self.show_main_menu(update, context)
         else:
             await loading_message.edit_text(
                 "❌ <b>Не удалось загрузить расписание</b>\n"
@@ -399,7 +528,7 @@ class ScheduleBot:
                 parse_mode='HTML'
             )
             await asyncio.sleep(1)
-            await self.show_quick_commands_menu(update, context)
+            await self.show_main_menu(update, context)
 
     async def show_main_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE, message_text=None):
         """Показать главное меню"""
@@ -407,7 +536,6 @@ class ScheduleBot:
             [InlineKeyboardButton("📅 Выбрать неделю", callback_data="select_week")],
             [InlineKeyboardButton("📆 Быстрый доступ по дням", callback_data="quick_days")],
             [InlineKeyboardButton("🔄 Обновить расписание", callback_data="refresh_schedule")],
-            [InlineKeyboardButton("🚀 Быстрые команды", callback_data="quick_commands")],
             [InlineKeyboardButton("🐛 Отладка", callback_data="debug_weeks")],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -447,8 +575,8 @@ class ScheduleBot:
         if success:
             await message.edit_text("✅ Расписание обновлено!")
             await asyncio.sleep(1)
-            # Показываем меню быстрых команд после обновления
-            await self.show_quick_commands_menu(update, context)
+            # Показываем главное меню после обновления
+            await self.show_main_menu(update, context)
         else:
             await message.edit_text("❌ Не удалось обновить расписание")
 
@@ -465,21 +593,6 @@ class ScheduleBot:
         
         # Показываем выбор недели
         await self.show_week_selection_standalone(update, context)
-
-    def get_current_week_and_day(self):
-        """Получить текущую неделю и день"""
-        # Простая логика - берем первую неделю и текущий день недели
-        week_info = self.get_week_info()
-        if not week_info:
-            return "1", 0  # По умолчанию неделя 1, понедельник
-        
-        # Берем первую доступную неделю
-        week_number = sorted(week_info.keys())[0]
-        
-        # Текущий день недели (0-понедельник, 6-воскресенье)
-        current_day = (pd.Timestamp.now().dayofweek) % 6  # Воскресенье = 6, но у нас только 6 дней
-        
-        return week_number, current_day
 
     @rate_limit(limit_seconds=2)
     async def today(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -504,8 +617,25 @@ class ScheduleBot:
             )
             return
         
-        week_number, day_idx = self.get_current_week_and_day()
-        tomorrow_idx = (day_idx + 1) % 6  # Переход на следующий день
+        week_number, current_day = self.get_current_week_and_day()
+        
+        # Определяем день для завтра
+        tomorrow_idx = current_day + 1
+        week_change = False
+        
+        if tomorrow_idx >= 6:  # Если завтра воскресенье или после субботы
+            tomorrow_idx = 0
+            week_change = True
+        
+        # Если переходим на следующую неделю
+        if week_change:
+            week_info = self.get_week_info()
+            if week_info:
+                weeks = sorted(week_info.keys(), key=int)
+                current_index = weeks.index(week_number)
+                if current_index < len(weeks) - 1:
+                    week_number = weeks[current_index + 1]
+        
         await self.show_day_schedule_standalone(update, week_number, tomorrow_idx, "завтра")
 
     @rate_limit(limit_seconds=2)
@@ -547,7 +677,8 @@ class ScheduleBot:
             )
             return
         
-        week_number, _ = self.get_current_week_and_day()
+        # Для дней недели используем текущую учебную неделю
+        week_number = self.get_current_academic_week()
         await self.show_day_schedule_standalone(update, week_number, day_idx, day_name)
 
     async def show_day_schedule_standalone(self, update: Update, week_number: str, day_idx: int, day_name: str):
@@ -558,15 +689,21 @@ class ScheduleBot:
             None, self.get_1krd6_schedule, week_number, day_idx
         )
         
+        # Добавляем информацию о неделе
+        week_info = self.get_week_info()
+        week_data = week_info.get(week_number, {})
+        week_type = week_data.get('type', '')
+        
+        full_schedule = f"📅 <b>Неделя {week_number}</b> ({week_type})\n{schedule}"
+        
         keyboard = [
-            [InlineKeyboardButton("🚀 Быстрые команды", callback_data="quick_commands")],
-            [InlineKeyboardButton("📅 Другой день", callback_data="quick_days")],
+            [InlineKeyboardButton("📆 Другой день", callback_data="quick_days")],
             [InlineKeyboardButton("🔄 Другая неделя", callback_data="select_week")],
             [InlineKeyboardButton("📋 Главное меню", callback_data="back_to_menu")],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        await loading_message.edit_text(schedule, reply_markup=reply_markup, parse_mode='HTML')
+        await loading_message.edit_text(full_schedule, reply_markup=reply_markup, parse_mode='HTML')
 
     async def show_week_selection_standalone(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показать выбор недели как отдельное сообщение"""
@@ -581,7 +718,6 @@ class ScheduleBot:
             button_text = f"Неделя {week_num} ({info['type']})"
             keyboard.append([InlineKeyboardButton(button_text, callback_data=f"week_{week_num}")])
         
-        keyboard.append([InlineKeyboardButton("🚀 Быстрые команды", callback_data="quick_commands")])
         keyboard.append([InlineKeyboardButton("📆 Быстрый доступ по дням", callback_data="quick_days")])
         keyboard.append([InlineKeyboardButton("🔄 Обновить", callback_data="refresh_schedule")])
         keyboard.append([InlineKeyboardButton("📋 Главное меню", callback_data="back_to_menu")])
@@ -606,21 +742,18 @@ class ScheduleBot:
         query = update.callback_query
         
         try:
+            # Всегда отвечаем на callback_query чтобы убрать "часики" в интерфейсе
             await query.answer()
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка ответа на callback: {e}")
         
         try:
             if query.data == "select_week":
                 await self.show_week_selection(query, context)
             elif query.data == "refresh_schedule":
                 await self.handle_refresh(query, context)
-            elif query.data == "quick_access":
-                await self.show_quick_access(query, context)
             elif query.data == "quick_days":
                 await self.show_quick_days(query, context)
-            elif query.data == "quick_commands":
-                await self.show_quick_commands(query, context)
             elif query.data == "debug_weeks":
                 await self.handle_debug(query, context)
             elif query.data == "back_to_menu":
@@ -633,7 +766,7 @@ class ScheduleBot:
                 await self.handle_all_days(query, context, query.data.replace("all_days_", ""))
             elif query.data.startswith("quick_day_"):
                 await self.handle_quick_day_selection(query, context, query.data.replace("quick_day_", ""))
-            # Обработка быстрых команд
+            # Обработка быстрых команд из меню дней
             elif query.data == "quick_today":
                 await self.handle_quick_today(query, context)
             elif query.data == "quick_tomorrow":
@@ -655,39 +788,18 @@ class ScheduleBot:
             logger.error(f"❌ Ошибка callback: {e}")
             try:
                 await query.edit_message_text("❌ Произошла ошибка. Попробуйте еще раз.")
-            except:
-                pass
-
-    async def show_quick_commands(self, query, context: ContextTypes.DEFAULT_TYPE):
-        """Показать меню быстрых команд"""
-        keyboard = [
-            [InlineKeyboardButton("📅 Сегодня", callback_data="quick_today")],
-            [InlineKeyboardButton("📆 Завтра", callback_data="quick_tomorrow")],
-            [InlineKeyboardButton("📋 Главное меню", callback_data="back_to_menu")],
-            [
-                InlineKeyboardButton("Пн", callback_data="quick_monday"),
-                InlineKeyboardButton("Вт", callback_data="quick_tuesday"),
-                InlineKeyboardButton("Ср", callback_data="quick_wednesday"),
-                InlineKeyboardButton("Чт", callback_data="quick_thursday"),
-                InlineKeyboardButton("Пт", callback_data="quick_friday"),
-                InlineKeyboardButton("Сб", callback_data="quick_saturday")
-            ],
-            [InlineKeyboardButton("🔄 Обновить", callback_data="refresh_schedule")],
-            [InlineKeyboardButton("📊 Недели", callback_data="select_week")],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await self.safe_edit_message(
-            query,
-            "🚀 <b>Быстрые команды</b>\n\n"
-            "Выберите действие для быстрого доступа к расписанию:",
-            reply_markup
-        )
+            except Exception as edit_error:
+                logger.error(f"❌ Ошибка редактирования сообщения: {edit_error}")
 
     async def handle_quick_today(self, query, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик быстрой команды 'Сегодня'"""
-        if not self.is_data_loaded():
-            await self.safe_edit_message(query, "❌ Данные не загружены. Сначала обновите расписание.")
+        # Проверяем загрузку данных с правильным сообщением
+        df = self.get_dataframe()
+        if df is None or not self.is_data_loaded():
+            await self.safe_edit_message(
+                query, 
+                "❌ Данные не загружены. Используйте /start или /refresh для загрузки расписания."
+            )
             return
         
         week_number, day_idx = self.get_current_week_and_day()
@@ -695,21 +807,47 @@ class ScheduleBot:
 
     async def handle_quick_tomorrow(self, query, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик быстрой команды 'Завтра'"""
-        if not self.is_data_loaded():
-            await self.safe_edit_message(query, "❌ Данные не загружены. Сначала обновите расписание.")
+        df = self.get_dataframe()
+        if df is None or not self.is_data_loaded():
+            await self.safe_edit_message(
+                query, 
+                "❌ Данные не загружены. Используйте /start или /refresh для загрузки расписания."
+            )
             return
         
-        week_number, day_idx = self.get_current_week_and_day()
-        tomorrow_idx = (day_idx + 1) % 6
+        week_number, current_day = self.get_current_week_and_day()
+        
+        # Определяем день для завтра
+        tomorrow_idx = current_day + 1
+        week_change = False
+        
+        if tomorrow_idx >= 6:  # Если завтра воскресенье или после субботы
+            tomorrow_idx = 0
+            week_change = True
+        
+        # Если переходим на следующую неделю
+        if week_change:
+            week_info = self.get_week_info()
+            if week_info:
+                weeks = sorted(week_info.keys(), key=int)
+                current_index = weeks.index(week_number)
+                if current_index < len(weeks) - 1:
+                    week_number = weeks[current_index + 1]
+        
         await self.show_quick_day_schedule(query, week_number, tomorrow_idx, "завтра")
 
     async def handle_quick_day(self, query, context: ContextTypes.DEFAULT_TYPE, day_idx: int, day_name: str):
         """Обработчик быстрой команды дня недели"""
-        if not self.is_data_loaded():
-            await self.safe_edit_message(query, "❌ Данные не загружены. Сначала обновите расписание.")
+        df = self.get_dataframe()
+        if df is None or not self.is_data_loaded():
+            await self.safe_edit_message(
+                query, 
+                "❌ Данные не загружены. Используйте /start или /refresh для загрузки расписания."
+            )
             return
         
-        week_number, _ = self.get_current_week_and_day()
+        # Для дней недели используем текущую учебную неделю
+        week_number = self.get_current_academic_week()
         await self.show_quick_day_schedule(query, week_number, day_idx, day_name)
 
     async def show_quick_day_schedule(self, query, week_number: str, day_idx: int, day_name: str):
@@ -720,15 +858,21 @@ class ScheduleBot:
             None, self.get_1krd6_schedule, week_number, day_idx
         )
         
+        # Добавляем информацию о неделе
+        week_info = self.get_week_info()
+        week_data = week_info.get(week_number, {})
+        week_type = week_data.get('type', '')
+        
+        full_schedule = f"📅 <b>Неделя {week_number}</b> ({week_type})\n{schedule}"
+        
         keyboard = [
-            [InlineKeyboardButton("🚀 Быстрые команды", callback_data="quick_commands")],
-            [InlineKeyboardButton("📅 Другой день", callback_data="quick_days")],
+            [InlineKeyboardButton("📆 Другой день", callback_data="quick_days")],
             [InlineKeyboardButton("🔄 Другая неделя", callback_data="select_week")],
             [InlineKeyboardButton("📋 Главное меню", callback_data="back_to_menu")],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        await self.safe_edit_message(query, schedule, reply_markup)
+        await self.safe_edit_message(query, full_schedule, reply_markup)
 
     async def handle_refresh(self, query, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик обновления расписания"""
@@ -738,30 +882,57 @@ class ScheduleBot:
         if success:
             await self.safe_edit_message(query, "✅ Расписание обновлено!")
             await asyncio.sleep(1)
-            await self.show_quick_commands(query, context)
+            # Используем query для перехода в главное меню
+            await self.show_main_menu_from_query(query, context)
         else:
             await self.safe_edit_message(query, "❌ Не удалось обновить расписание")
+
+    async def show_main_menu_from_query(self, query, context: ContextTypes.DEFAULT_TYPE):
+        """Показать главное меню из callback query"""
+        keyboard = [
+            [InlineKeyboardButton("📅 Выбрать неделю", callback_data="select_week")],
+            [InlineKeyboardButton("📆 Быстрый доступ по дням", callback_data="quick_days")],
+            [InlineKeyboardButton("🔄 Обновить расписание", callback_data="refresh_schedule")],
+            [InlineKeyboardButton("🐛 Отладка", callback_data="debug_weeks")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        status = "✅ Актуальное" if self.data_loaded else "⚠️ Старое"
+        
+        text = (
+            f"👋 <b>Бот расписания 1-КРД-6</b>\n\n"
+            f"📊 <b>Статус данных:</b> {status}\n\n"
+            "🚀 <b>Доступные команды:</b>\n"
+            "• /menu - Главное меню\n"
+            "• /refresh - Обновить расписание\n"
+            "• /week - Выбрать неделю\n"
+            "• /today - Сегодня\n• /tomorrow - Завтра\n"
+            "• /monday - Пн\n• /tuesday - Вт\n• /wednesday - Ср\n"
+            "• /thursday - Чт\n• /friday - Пт\n• /saturday - Сб\n\n"
+            "👇 <i>Или используйте кнопки ниже:</i>"
+        )
+        
+        await self.safe_edit_message(query, text, reply_markup)
 
     async def show_quick_days(self, query, context: ContextTypes.DEFAULT_TYPE):
         """Быстрый доступ по дням недели"""
         keyboard = [
             [
-                InlineKeyboardButton("📆 Сегодня", callback_data="quick_day_today"),
-                InlineKeyboardButton("📆 Завтра", callback_data="quick_day_tomorrow")
+                InlineKeyboardButton("📆 Сегодня", callback_data="quick_today"),
+                InlineKeyboardButton("📆 Завтра", callback_data="quick_tomorrow")
             ],
             [
-                InlineKeyboardButton("📆 Понедельник", callback_data="quick_day_0"),
-                InlineKeyboardButton("📆 Вторник", callback_data="quick_day_1")
+                InlineKeyboardButton("📆 Понедельник", callback_data="quick_monday"),
+                InlineKeyboardButton("📆 Вторник", callback_data="quick_tuesday")
             ],
             [
-                InlineKeyboardButton("📆 Среда", callback_data="quick_day_2"),
-                InlineKeyboardButton("📆 Четверг", callback_data="quick_day_3")
+                InlineKeyboardButton("📆 Среда", callback_data="quick_wednesday"),
+                InlineKeyboardButton("📆 Четверг", callback_data="quick_thursday")
             ],
             [
-                InlineKeyboardButton("📆 Пятница", callback_data="quick_day_4"),
-                InlineKeyboardButton("📆 Суббота", callback_data="quick_day_5")
+                InlineKeyboardButton("📆 Пятница", callback_data="quick_friday"),
+                InlineKeyboardButton("📆 Суббота", callback_data="quick_saturday")
             ],
-            [InlineKeyboardButton("🚀 Быстрые команды", callback_data="quick_commands")],
             [InlineKeyboardButton("📅 Выбрать неделю", callback_data="select_week")],
             [InlineKeyboardButton("📋 Главное меню", callback_data="back_to_menu")],
         ]
@@ -776,8 +947,12 @@ class ScheduleBot:
 
     async def handle_quick_day_selection(self, query, context: ContextTypes.DEFAULT_TYPE, day_data):
         """Обработчик быстрого выбора дня"""
-        if not self.is_data_loaded():
-            await self.safe_edit_message(query, "❌ Данные не загружены. Сначала обновите расписание.")
+        df = self.get_dataframe()
+        if df is None or not self.is_data_loaded():
+            await self.safe_edit_message(
+                query, 
+                "❌ Данные не загружены. Используйте /start или /refresh для загрузки расписания."
+            )
             return
         
         week_number, current_day = self.get_current_week_and_day()
@@ -799,34 +974,21 @@ class ScheduleBot:
             None, self.get_1krd6_schedule, week_number, day_idx
         )
         
+        # Добавляем информацию о неделе
+        week_info = self.get_week_info()
+        week_data = week_info.get(week_number, {})
+        week_type = week_data.get('type', '')
+        
+        full_schedule = f"📅 <b>Неделя {week_number}</b> ({week_type})\n{schedule}"
+        
         keyboard = [
-            [InlineKeyboardButton("🚀 Быстрые команды", callback_data="quick_commands")],
             [InlineKeyboardButton("📆 Другой день", callback_data="quick_days")],
             [InlineKeyboardButton("🔄 Другая неделя", callback_data="select_week")],
             [InlineKeyboardButton("📋 Главное меню", callback_data="back_to_menu")],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        await self.safe_edit_message(query, schedule, reply_markup)
-
-    async def show_quick_access(self, query, context: ContextTypes.DEFAULT_TYPE):
-        """Быстрый доступ к расписанию"""
-        keyboard = [
-            [InlineKeyboardButton("📅 Текущая неделя", callback_data="week_1")],
-            [InlineKeyboardButton("📅 Следующая неделя", callback_data="week_2")],
-            [InlineKeyboardButton("🚀 Быстрые команды", callback_data="quick_commands")],
-            [InlineKeyboardButton("📆 Быстрый доступ по дням", callback_data="quick_days")],
-            [InlineKeyboardButton("🔄 Обновить", callback_data="refresh_schedule")],
-            [InlineKeyboardButton("📋 Главное меню", callback_data="back_to_menu")],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await self.safe_edit_message(
-            query,
-            "🚀 <b>Быстрый доступ</b>\n\n"
-            "Выберите действие для быстрого просмотра расписания:",
-            reply_markup
-        )
+        await self.safe_edit_message(query, full_schedule, reply_markup)
 
     async def show_week_selection(self, query=None, context: ContextTypes.DEFAULT_TYPE = None):
         """Показать выбор недели"""
@@ -842,7 +1004,6 @@ class ScheduleBot:
             button_text = f"Неделя {week_num} ({info['type']})"
             keyboard.append([InlineKeyboardButton(button_text, callback_data=f"week_{week_num}")])
         
-        keyboard.append([InlineKeyboardButton("🚀 Быстрые команды", callback_data="quick_commands")])
         keyboard.append([InlineKeyboardButton("📆 Быстрый доступ по дням", callback_data="quick_days")])
         keyboard.append([InlineKeyboardButton("🔄 Обновить", callback_data="refresh_schedule")])
         keyboard.append([InlineKeyboardButton("📋 Главное меню", callback_data="back_to_menu")])
@@ -867,7 +1028,6 @@ class ScheduleBot:
             keyboard.append([InlineKeyboardButton(day_name, callback_data=f"day_{week_number}_{day_idx}")])
         
         keyboard.append([InlineKeyboardButton("📅 Вся неделя", callback_data=f"all_days_{week_number}")])
-        keyboard.append([InlineKeyboardButton("🚀 Быстрые команды", callback_data="quick_commands")])
         keyboard.append([InlineKeyboardButton("📆 Быстрый доступ по дням", callback_data="quick_days")])
         keyboard.append([InlineKeyboardButton("🔄 Другая неделя", callback_data="select_week")])
         keyboard.append([InlineKeyboardButton("📋 Главное меню", callback_data="back_to_menu")])
@@ -897,7 +1057,6 @@ class ScheduleBot:
         )
         
         keyboard = [
-            [InlineKeyboardButton("🚀 Быстрые команды", callback_data="quick_commands")],
             [InlineKeyboardButton("📅 Другой день", callback_data=f"week_{week_number}")],
             [InlineKeyboardButton("📆 Быстрый доступ по дням", callback_data="quick_days")],
             [InlineKeyboardButton("🔄 Другая неделя", callback_data="select_week")],
@@ -916,7 +1075,6 @@ class ScheduleBot:
         )
         
         keyboard = [
-            [InlineKeyboardButton("🚀 Быстрые команды", callback_data="quick_commands")],
             [InlineKeyboardButton("📅 Конкретный день", callback_data=f"week_{week_number}")],
             [InlineKeyboardButton("📆 Быстрый доступ по дням", callback_data="quick_days")],
             [InlineKeyboardButton("🔄 Другая неделя", callback_data="select_week")],
@@ -975,7 +1133,7 @@ class ScheduleBot:
             return f"❌ Ошибка: {str(e)}"
 
     def _get_day_schedule(self, week_number, day_idx, show_day_header=True):
-        """Оптимизированное получение расписания дня"""
+        """Оптимизированное получение расписания дня с датой"""
         try:
             df = self.get_dataframe()
             if df is None:
@@ -989,7 +1147,12 @@ class ScheduleBot:
             day_col = week_data['columns'][day_idx]
             
             days = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота']
-            day_schedule = f"<b>{days[day_idx]}</b>\n" if show_day_header else ""
+            
+            # Получаем дату дня для ВСЕХ дней
+            day_date = self.get_day_date(week_number, day_idx)
+            date_suffix = f" ({day_date})" if day_date else ""
+            
+            day_schedule = f"<b>{days[day_idx]}{date_suffix}</b>\n" if show_day_header else ""
             has_classes = False
             
             # Оптимизированный поиск времени
