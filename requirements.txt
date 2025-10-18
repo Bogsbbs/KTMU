@@ -1,0 +1,11 @@
+python-telegram-bot==20.7
+pandas==2.0.3
+python-dotenv==1.0.0
+requests==2.31.0
+beautifulsoup4==4.12.2
+openpyxl==3.1.2
+lxml==4.9.3
+aiohttp==3.8.5
+httpx==0.24.1
+flask==2.3.3
+gunicorn==21.2.0
