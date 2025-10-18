@@ -19,7 +19,32 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 load_dotenv()
-
+def keep_alive(self):
+    """Запуск веб-сервера для поддержания активности"""
+    from flask import Flask
+    from threading import Thread
+    
+    app = Flask('')
+    
+    @app.route('/')
+    def home():
+        return "✅ Schedule Bot is running on Scalingo!"
+    
+    @app.route('/health')
+    def health():
+        return "🟢 Bot is healthy and running"
+    
+    @app.route('/ping')
+    def ping():
+        return "pong"
+    
+    def run():
+        app.run(host='0.0.0.0', port=self.port)
+    
+    t = Thread(target=run)
+    t.daemon = True
+    t.start()
+    logger.info(f"🌐 Веб-сервер запущен на порту {self.port}")
 def rate_limit(limit_seconds=2):
     """Декоратор для защиты от множественных нажатий"""
     def decorator(func):
@@ -73,6 +98,7 @@ class ScheduleBot:
         self.last_download_time = None
         self.data_loaded = False
         self.last_action_time = {}
+        self.port = int(os.environ.get("PORT", 8080))
         
     def download_schedule_from_website(self):
         """Скачать расписание с сайта ktmu-sutd.ru"""
